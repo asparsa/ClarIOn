@@ -130,5 +130,11 @@ foreach(test_file ${UTILITIES_TEST_SOURCES})
     target_link_libraries(${target_name} PRIVATE --coverage)
   endif()
 
+  set(test_working_directory
+      "${CMAKE_CURRENT_BINARY_DIR}/workdirs/${target_name}")
+  file(MAKE_DIRECTORY "${test_working_directory}")
+
   add_test(NAME utilities/${bin_exec} COMMAND ${target_name})
+  set_tests_properties(utilities/${bin_exec} PROPERTIES
+                       WORKING_DIRECTORY "${test_working_directory}")
 endforeach()

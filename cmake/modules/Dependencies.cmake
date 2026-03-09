@@ -11,6 +11,15 @@ set(CPM_SOURCE_CACHE "${CMAKE_SOURCE_DIR}/.cpmsource")
 
 find_package(Threads REQUIRED)
 
+# Find MPI if enabled
+option(DFTRACER_UTILS_ENABLE_MPI "Enable MPI support" OFF)
+if(DFTRACER_UTILS_ENABLE_MPI)
+  find_package(MPI REQUIRED)
+  message(STATUS "MPI support enabled")
+  message(STATUS "  MPI_CXX_COMPILER: ${MPI_CXX_COMPILER}")
+  message(STATUS "  MPI_CXX_LIBRARIES: ${MPI_CXX_LIBRARIES}")
+endif()
+
 set(DEPENDENCY_LIBRARY_DIRS "")
 
 if(CMAKE_VERSION VERSION_LESS 3.18)

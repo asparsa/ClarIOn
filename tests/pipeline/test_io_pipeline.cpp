@@ -18,6 +18,29 @@
 
 using namespace dftracer::utils;
 
+namespace {
+
+fs::path make_test_io_directory(const std::string& name) {
+    static std::atomic<std::uint64_t> counter{0};
+
+    const auto unique_suffix =
+        std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count()) +
+        "_" + std::to_string(counter.fetch_add(1, std::memory_order_relaxed));
+
+    const auto test_dir =
+        fs::temp_directory_path() / (name + "_" + unique_suffix);
+    fs::create_directories(test_dir);
+    return test_dir;
+}
+
+void cleanup_test_io_directory(const fs::path& test_dir) {
+    std::error_code ec;
+    fs::remove_all(test_dir, ec);
+}
+
+}  // namespace
+
 // ============================================================================
 // IOExecutor Basic Tests
 // ============================================================================
@@ -639,9 +662,9 @@ TEST_CASE("Real IO - Write and read file") {
 
     io_executor->start();
 
+    const auto test_dir = make_test_io_directory("test_io_executor_write_read");
     const auto test_file =
-        (fs::temp_directory_path() / "test_io_executor_write_read.txt")
-            .string();
+        (test_dir / "test_io_executor_write_read.txt").string();
     const std::string test_data = "Hello from IOExecutor!";
     std::atomic<bool> write_done{false};
     std::atomic<bool> read_done{false};
@@ -693,7 +716,7 @@ TEST_CASE("Real IO - Write and read file") {
     CHECK(read_data == test_data);
 
     // Cleanup
-    std::remove(test_file.c_str());
+    cleanup_test_io_directory(test_dir);
 
     io_executor->shutdown();
 }
@@ -705,14 +728,14 @@ TEST_CASE("Real IO - Multiple file writes") {
     io_executor->start();
 
     constexpr int NUM_FILES = 10;
+    const auto test_dir = make_test_io_directory("test_io_executor_files");
     std::atomic<int> completed{0};
     std::vector<std::string> file_paths;
 
     // Create multiple write operations
     for (int i = 0; i < NUM_FILES; ++i) {
         auto file_path =
-            (fs::temp_directory_path() /
-             ("test_io_executor_file_" + std::to_string(i) + ".txt"))
+            (test_dir / ("test_io_executor_file_" + std::to_string(i) + ".txt"))
                 .string();
         file_paths.push_back(file_path);
 
@@ -750,9 +773,7 @@ TEST_CASE("Real IO - Multiple file writes") {
     }
 
     // Cleanup
-    for (const auto& path : file_paths) {
-        std::remove(path.c_str());
-    }
+    cleanup_test_io_directory(test_dir);
 
     io_executor->shutdown();
 }
@@ -764,24 +785,27 @@ TEST_CASE("Real IO - Concurrent reads and writes") {
     io_executor->start();
 
     constexpr int NUM_OPS = 20;
+    const auto test_dir = make_test_io_directory("test_io_concurrent");
     std::atomic<int> write_count{0};
     std::atomic<int> read_count{0};
     std::vector<std::string> file_paths;
 
     // Submit interleaved write and read operations
     for (int i = 0; i < NUM_OPS / 2; ++i) {
-        auto file_path = (fs::temp_directory_path() /
-                          ("test_io_concurrent_" + std::to_string(i) + ".txt"))
-                             .string();
+        auto file_path =
+            (test_dir / ("test_io_concurrent_" + std::to_string(i) + ".txt"))
+                .string();
         file_paths.push_back(file_path);
+        auto write_ready = std::make_shared<std::atomic<bool>>(false);
 
         // Write operation
-        auto write_func = [file_path, i, &write_count]() {
+        auto write_func = [file_path, i, write_ready, &write_count]() {
             FILE* f = fopen(file_path.c_str(), "w");
             if (f) {
                 std::string content = "Data " + std::to_string(i * 100);
                 fwrite(content.c_str(), 1, content.size(), f);
                 fclose(f);
+                write_ready->store(true, std::memory_order_release);
                 write_count.fetch_add(1);
             }
         };
@@ -789,17 +813,28 @@ TEST_CASE("Real IO - Concurrent reads and writes") {
         io_executor->submit_io_operation(write_func, std::coroutine_handle<>{},
                                          i % 8);
 
-        // Short delay to ensure write happens first
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-
         // Read operation
-        auto read_func = [file_path, &read_count]() {
-            FILE* f = fopen(file_path.c_str(), "r");
-            if (f) {
-                char buffer[256];
-                fread(buffer, 1, sizeof(buffer), f);
-                fclose(f);
-                read_count.fetch_add(1);
+        auto read_func = [file_path, write_ready, &read_count]() {
+            auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(5);
+
+            while (std::chrono::steady_clock::now() < deadline) {
+                if (!write_ready->load(std::memory_order_acquire)) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    continue;
+                }
+
+                FILE* f = fopen(file_path.c_str(), "r");
+                if (f) {
+                    char buffer[256];
+                    [[maybe_unused]] size_t bytes_read =
+                        fread(buffer, 1, sizeof(buffer), f);
+                    fclose(f);
+                    read_count.fetch_add(1);
+                    return;
+                }
+
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
         };
 
@@ -810,7 +845,8 @@ TEST_CASE("Real IO - Concurrent reads and writes") {
     // Wait for all operations to complete
     auto start = std::chrono::steady_clock::now();
     while ((write_count.load() + read_count.load()) < NUM_OPS &&
-           std::chrono::steady_clock::now() - start < std::chrono::seconds(5)) {
+           std::chrono::steady_clock::now() - start <
+               std::chrono::seconds(10)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
@@ -818,9 +854,7 @@ TEST_CASE("Real IO - Concurrent reads and writes") {
     CHECK(read_count.load() == NUM_OPS / 2);
 
     // Cleanup
-    for (const auto& path : file_paths) {
-        std::remove(path.c_str());
-    }
+    cleanup_test_io_directory(test_dir);
 
     io_executor->shutdown();
 }
@@ -831,8 +865,8 @@ TEST_CASE("Real IO - Large file write and read") {
 
     io_executor->start();
 
-    const auto test_file =
-        (fs::temp_directory_path() / "test_io_large_file.bin").string();
+    const auto test_dir = make_test_io_directory("test_io_large_file");
+    const auto test_file = (test_dir / "test_io_large_file.bin").string();
     constexpr size_t FILE_SIZE = 1024 * 1024;  // 1 MB
     std::vector<char> write_data(FILE_SIZE);
 
@@ -892,7 +926,7 @@ TEST_CASE("Real IO - Large file write and read") {
     CHECK(read_data == write_data);
 
     // Cleanup
-    std::remove(test_file.c_str());
+    cleanup_test_io_directory(test_dir);
 
     io_executor->shutdown();
 }
@@ -903,8 +937,8 @@ TEST_CASE("Real IO - File stat operations") {
 
     io_executor->start();
 
-    const auto test_file =
-        (fs::temp_directory_path() / "test_io_stat.txt").string();
+    const auto test_dir = make_test_io_directory("test_io_stat");
+    const auto test_file = (test_dir / "test_io_stat.txt").string();
     const std::string test_content = "Test content for stat";
 
     std::atomic<bool> write_done{false};
@@ -957,7 +991,7 @@ TEST_CASE("Real IO - File stat operations") {
     CHECK(file_size.load() == test_content.size());
 
     // Cleanup
-    std::remove(test_file.c_str());
+    cleanup_test_io_directory(test_dir);
 
     io_executor->shutdown();
 }

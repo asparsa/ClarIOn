@@ -173,6 +173,8 @@ set(DFTRACER_UTILS_UTILITIES_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/dftracer/utils/utilities/call_tree/call_tree.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/dftracer/utils/utilities/call_tree/call_tree_internal.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/dftracer/utils/utilities/call_tree/json_serializer.cpp
+    # Replay
+    ${CMAKE_CURRENT_SOURCE_DIR}/dftracer/utils/utilities/replay/replay.cpp
 )
 
 # Add MPI-specific call tree sources if MPI is enabled
@@ -699,6 +701,8 @@ if(DFTRACER_UTILS_BUILD_BINARIES)
       ${CMAKE_CURRENT_SOURCE_DIR}/dftracer/utils/binaries/dftracer_merge.cpp
       ${CMAKE_CURRENT_SOURCE_DIR}/dftracer/utils/binaries/dftracer_split.cpp
       ${CMAKE_CURRENT_SOURCE_DIR}/dftracer/utils/binaries/dftracer_info.cpp
+      ${CMAKE_CURRENT_SOURCE_DIR}/dftracer/utils/binaries/dftracer_replay.cpp
+      ${CMAKE_CURRENT_SOURCE_DIR}/dftracer/utils/binaries/dftracer_call_tree.cpp
       ${CMAKE_CURRENT_SOURCE_DIR}/dftracer/utils/binaries/dftracer_aggregator.cpp
       ${CMAKE_CURRENT_SOURCE_DIR}/dftracer/utils/binaries/dftracer_index.cpp
       ${CMAKE_CURRENT_SOURCE_DIR}/dftracer/utils/binaries/dftracer_gen_fake_trace.cpp

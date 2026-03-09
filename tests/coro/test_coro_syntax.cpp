@@ -42,7 +42,7 @@ TEST_CASE("CoroTask - then() with transformation inside coroutine") {
             // Use then() to transform the result
             auto transformed = compute().then([](int x) { return x * 2; });
 
-            int result = co_await transformed;
+            int result = co_await std::move(transformed);
             co_return std::to_string(result);
         },
         "Parent");

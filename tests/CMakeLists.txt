@@ -46,6 +46,9 @@ set(TEST_CPP_SOURCES
     reader/test_reader_formats.cpp
     reader/test_reader_robustness.cpp
     # reader/test_reader_tar_comprehensive.cpp
+    # Replay tests
+    test_replay.cpp
+    test_replay_binary.cpp
     )
 
 foreach(test_file ${TEST_CPP_SOURCES})
@@ -61,6 +64,9 @@ foreach(test_file ${TEST_CPP_SOURCES})
   target_link_libraries(${target_name} PRIVATE doctest::doctest testing_utilities)
   target_set_warnings(${target_name})
   target_enable_coroutine(${target_name})
+  
+  # Pass CMAKE_BINARY_DIR to tests that need to execute binaries
+  target_compile_definitions(${target_name} PRIVATE CMAKE_BINARY_DIR="${CMAKE_BINARY_DIR}")
 
   # Set output directory to preserve folder structure in binaries
   get_filename_component(bin_dir ${bin_exec} DIRECTORY)
@@ -81,6 +87,13 @@ foreach(test_file ${TEST_CPP_SOURCES})
   endif()
 
   add_test(NAME ${bin_exec} COMMAND ${target_name})
+
+  # Ensure binary tests can find the dftracer_replay executable
+  if("${target_name}" STREQUAL "test_replay_binary")
+    if(TARGET dftracer_replay)
+      add_dependencies(${target_name} dftracer_replay)
+    endif()
+  endif()
 endforeach()
 
 # +++++++++++++++++++++++++++++++++++++++++

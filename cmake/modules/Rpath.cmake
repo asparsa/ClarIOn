@@ -15,11 +15,10 @@ macro(add_rpath)
         "@executable_path/../lib64"
         "@executable_path/../../lib64"
         "${DEPENDENCY_LIBRARY_DIRS}")
-    if(SKBUILD)
-      set(CMAKE_BUILD_WITH_INSTALL_RPATH ON)
-    else()
-      set(CMAKE_BUILD_WITH_INSTALL_RPATH OFF)
-    endif()
+    # Always use install RPATH in build tree so binaries find
+    # their shared libraries when invoked via popen() or other
+    # contexts where DYLD_LIBRARY_PATH is stripped by SIP.
+    set(CMAKE_BUILD_WITH_INSTALL_RPATH ON)
     set(CMAKE_MACOSX_RPATH ON)
   else()
     # Linux uses $ORIGIN
