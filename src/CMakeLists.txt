@@ -867,6 +867,8 @@ if(DFTRACER_UTILS_BUILD_BINARIES)
       ${CMAKE_CURRENT_SOURCE_DIR}/dftracer/utils/binaries/dftracer_split.cpp
       ${CMAKE_CURRENT_SOURCE_DIR}/dftracer/utils/binaries/dftracer_info.cpp
       ${CMAKE_CURRENT_SOURCE_DIR}/dftracer/utils/binaries/dftracer_replay.cpp
+      ${CMAKE_CURRENT_SOURCE_DIR}/dftracer/utils/binaries/clarion_calltree.cpp
+      ${CMAKE_CURRENT_SOURCE_DIR}/dftracer/utils/binaries/clarion_comparator.cpp
       ${CMAKE_CURRENT_SOURCE_DIR}/dftracer/utils/binaries/dftracer_call_tree.cpp
       ${CMAKE_CURRENT_SOURCE_DIR}/dftracer/utils/binaries/dftracer_aggregator.cpp
       ${CMAKE_CURRENT_SOURCE_DIR}/dftracer/utils/binaries/dftracer_index.cpp
