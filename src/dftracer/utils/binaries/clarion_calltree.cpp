@@ -1,10 +1,4 @@
 // ClarIOn call tree analysis on the dftracer_call_tree pipeline.
-//
-// Ingestion/processing is dftracer-style (indexed TraceReader, simdjson
-// ondemand event parsing, coroutine pipeline with per-file and per-process
-// fan-out); results and output are ClarIOn-style. Fully self-contained:
-// uses only public dftracer-utils APIs, no library modifications.
-//
 // DAG:
 //   scan -> build -> merge -> analyze -> reduce -> write
 //
@@ -26,9 +20,6 @@
 // write     : --format text   -> ClarIOn print_tree output
 //                                (dur/depth/count/min/max/mean, %% of
 //                                total/parent)
-//             --format binary -> ClarIOn .call_tree format
-//                                (magic 0xCA117EE1, byte-compatible with
-//                                ClarIOn's load_calltree)
 //             --format json   -> Chrome Tracing JSON with agg stats in args
 
 #include <dftracer/utils/call_tree/internal/process_key.h>
@@ -69,12 +60,8 @@ using dftracer::utils::call_tree::internal::ProcessKey;
 
 namespace {
 
-enum class OutputFormat { TEXT, BINARY, JSON };
+enum class OutputFormat { TEXT, JSON };
 
-// ── ClarIOn binary file format constants ────────────────────────────────────
-
-constexpr std::uint32_t CALLTREE_MAGIC = 0xCA117EE1;
-constexpr std::uint32_t CALLTREE_VERSION = 0x00000001;
 
 // ── Raw event storage ───────────────────────────────────────────────────────
 // Names are interned once so RawEvent/AggNode carry cheap non-owning views
@@ -100,7 +87,7 @@ using BucketMap = std::unordered_map<ProcessKey, Bucket>;
 
 struct AggNode {
     std::string_view name;
-    std::uint64_t first_ts = 0;  // earliest occurrence (raw JSON layout)
+    std::uint64_t first_ts = 0;  
     long long dur = 0;           // inclusive, summed across merged occurrences
     long long count = 1;
     long long min = std::numeric_limits<long long>::max();
@@ -205,8 +192,6 @@ void dedup_forest(std::vector<AggNode*>& roots) {
     dedup_list(roots);
 }
 
-// ── Pruning (ported from ClarIOn) ───────────────────────────────────────────
-
 void prune_hot_paths(AggNode* node, double threshold_pct) {
     if (node->children.empty()) return;
     long long max_dur = std::numeric_limits<long long>::min();
@@ -277,9 +262,6 @@ void prune_threshold_forest(std::vector<AggNode*>& roots, double threshold_pct,
 //
 // Nesting is inferred ClarIOn-style from time-span containment (sort by
 // start time, outer interval first on ties, then a single stack sweep).
-// This deliberately does NOT use DFTracer's args["level"], which many
-// traces (e.g. HDF5/VOL ones) lack. Containment needs only ts/dur, and
-// within a (pid, tid, node) bucket it reproduces ClarIOn's tree exactly.
 
 void project_bucket(const Bucket& events, bool inclusive_containment,
                     AggForest& forest) {
@@ -403,37 +385,6 @@ void render_forest_text(const std::vector<AggNode*>& roots,
     render_tree_nodes(roots, total_run_time, std::string(""), -1, 0, out);
 }
 
-// ── Binary output (byte-compatible with ClarIOn save_calltree) ─────────────
-
-template <typename T>
-void append_pod(std::string& out, const T& v) {
-    out.append(reinterpret_cast<const char*>(&v), sizeof(T));
-}
-
-void append_binary_node(std::string& out, const AggNode* n) {
-    const std::uint16_t name_len = static_cast<std::uint16_t>(n->name.size());
-    append_pod(out, name_len);
-    out.append(n->name.data(), name_len);
-    append_pod(out, n->dur);  // long long
-    const std::int32_t count = static_cast<std::int32_t>(n->count);
-    append_pod(out, count);
-    append_pod(out, n->min);   // long long
-    append_pod(out, n->max);   // long long
-    append_pod(out, n->hash);  // std::size_t
-    const std::uint32_t n_children =
-        static_cast<std::uint32_t>(n->children.size());
-    append_pod(out, n_children);
-    for (const AggNode* c : n->children) append_binary_node(out, c);
-}
-
-void render_forest_binary(const std::vector<AggNode*>& roots,
-                          std::string& out) {
-    append_pod(out, CALLTREE_MAGIC);
-    append_pod(out, CALLTREE_VERSION);
-    const std::uint64_t n_roots = roots.size();
-    append_pod(out, n_roots);
-    for (const AggNode* r : roots) append_binary_node(out, r);
-}
 
 bool write_file(const std::string& path, const std::string& bytes) {
     FILE* f = std::fopen(path.c_str(), "wb");
@@ -476,10 +427,7 @@ void append_escaped(std::string& out, std::string_view s) {
     }
 }
 
-// Emit one node and its subtree. When `synthetic` is set (aggregated trees
-// have no meaningful timestamps), children are packed flame-graph style
-// inside the parent span; otherwise real first-occurrence timestamps are
-// used. Every event line ends with ",\n"; the caller trims the last one.
+
 void serialize_agg(const AggNode* n, std::uint64_t start, int depth,
                    bool synthetic, std::uint32_t pid, std::uint32_t tid,
                    std::uint64_t& idx, std::string& out) {
@@ -507,7 +455,104 @@ void serialize_agg(const AggNode* n, std::uint64_t start, int depth,
         cursor += static_cast<std::uint64_t>(std::max<long long>(c->dur, 0));
     }
 }
+struct FoundNode {
+    const AggNode* node = nullptr;
+    ProcessKey key;         // bucket the match came from
+    long long total_run_time = 0;  // that bucket's span, for %-of-total
+};
 
+void find_in_nodes(const std::vector<AggNode*>& nodes, std::string_view needle,
+                   const ProcessKey& key, long long total_run_time,
+                   std::vector<FoundNode>& out) {
+    for (const AggNode* n : nodes) {
+        if (n->name.find(needle) != std::string_view::npos) {
+            out.push_back({n, key, total_run_time});
+            continue;  // subtree already covered by this hit
+        }
+        find_in_nodes(n->children, needle, key, total_run_time, out);
+    }
+}
+
+std::vector<FoundNode> find_in_forest(const AggForest& forest,
+                                      std::string_view needle) {
+    std::vector<FoundNode> out;
+    find_in_nodes(forest.roots, needle, forest.key, forest.total_run_time(),
+                  out);
+    return out;
+}
+
+// text: every match rendered as its own tree, one after another.
+void render_matches_text(const std::vector<FoundNode>& matches,
+                         std::string_view needle, bool with_bucket_header,
+                         std::string& out) {
+    char buf[256];
+    if (matches.empty()) {
+        int w = std::snprintf(buf, sizeof(buf), "No match for \"%.*s\"\n",
+                              static_cast<int>(needle.size()), needle.data());
+        out.append(buf, static_cast<std::size_t>(w));
+        return;
+    }
+    for (std::size_t i = 0; i < matches.size(); ++i) {
+        const FoundNode& m = matches[i];
+        int w = std::snprintf(buf, sizeof(buf), "=== match %zu/%zu: ",
+                              i + 1, matches.size());
+        out.append(buf, static_cast<std::size_t>(w));
+        out.append(m.node->name.data(), m.node->name.size());
+        if (with_bucket_header) {
+            w = std::snprintf(buf, sizeof(buf), " (pid %u tid %u node %u)",
+                              m.key.pid, m.key.tid, m.key.node_id);
+            out.append(buf, static_cast<std::size_t>(w));
+        }
+        out += " ===\n";
+        // one-element forest: the match is the root, so its line carries
+        // "% of total" and its descendants "% of parent"
+        const std::vector<AggNode*> root{const_cast<AggNode*>(m.node)};
+        render_forest_text(root, m.total_run_time, out);
+        out += '\n';
+    }
+}
+
+// json: a complete Chrome Tracing document for a single match.
+std::string render_match_json(const FoundNode& match, bool synthetic) {
+    std::string out;
+    out.append("[\n", 2);
+    out.append(
+        "{\"name\":\"format\",\"cat\":\"M\",\"pid\":0,\"tid\":0,\"ph\":\"M\","
+        "\"args\":{\"value\":\"clarion_call_tree_find\"}},\n");
+    std::uint64_t idx = 0;
+    serialize_agg(match.node, /*start=*/0, /*depth=*/0, synthetic,
+                  match.key.pid, match.key.tid, idx, out);
+    if (out.size() >= 2 && out[out.size() - 2] == ',' &&
+        out[out.size() - 1] == '\n') {
+        out.resize(out.size() - 2);
+        out.append("\n]\n", 3);
+    } else {
+        out.append("]\n", 2);
+    }
+    return out;
+}
+
+// json/binary: <stem>_<sanitized name>_<index><ext>, one file per match.
+std::string match_output_path(const std::string& base, const FoundNode& match,
+                              std::size_t index, const std::string& ext) {
+    std::string stem = base;
+    if (stem.size() >= ext.size() &&
+        stem.compare(stem.size() - ext.size(), ext.size(), ext) == 0) {
+        stem.resize(stem.size() - ext.size());
+    }
+    std::string name;
+    name.reserve(match.node->name.size());
+    for (char c : match.node->name) {
+        const bool safe = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                          (c >= '0' && c <= '9') || c == '.' || c == '-' ||
+                          c == '_';
+        name += safe ? c : '_';
+    }
+    if (name.size() > 96) name.resize(96);
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "_%zu", index);
+    return stem + "_" + name + buf + ext;
+}
 // ── CLI / pipeline plumbing ─────────────────────────────────────────────────
 
 class ClarionArgParse : public cli::ArgParse {
@@ -517,6 +562,7 @@ class ClarionArgParse : public cli::ArgParse {
     std::vector<std::string> inputs;
     bool recursive = false;
     std::string output;
+    std::string find;
     bool no_save = false;
     bool gzip = false;
     bool time_exclusive = false;
@@ -554,8 +600,7 @@ class ClarionArgParse : public cli::ArgParse {
             .flag();
         parser()
             .add_argument("-f", "--format")
-            .help("Output format: 'text' (ClarIOn tree), 'binary' (ClarIOn "
-                  ".call_tree), or 'json' (Chrome Tracing)")
+            .help("Output format: 'text' (ClarIOn tree) or 'json' (Chrome Tracing)")
             .default_value<std::string>("text");
         parser()
             .add_argument("-a", "--aggregate")
@@ -582,6 +627,10 @@ class ClarionArgParse : public cli::ArgParse {
             .help("Drop children below this %% of their parent's duration")
             .default_value<double>(-1.0)
             .scan<'g', double>();
+        parser()
+            .add_argument("--find")
+            .help("Find a specific node in the call tree")
+            .default_value<std::string>("");
     }
 
     void post_parse() override {
@@ -595,26 +644,25 @@ class ClarionArgParse : public cli::ArgParse {
         global_merge = parser().get<bool>("--global");
         hotpath = parser().get<bool>("--hotpath");
         hotpath_threshold = parser().get<double>("--hotpath-threshold");
+        find = parser().get<std::string>("--find");
         threshold = parser().get<double>("--threshold");
         if (global_merge) aggregate = true;
 
         const std::string fmt = parser().get<std::string>("--format");
         if (fmt == "text") {
             format = OutputFormat::TEXT;
-        } else if (fmt == "binary") {
-            format = OutputFormat::BINARY;
         } else if (fmt == "json") {
             format = OutputFormat::JSON;
         } else {
             throw std::runtime_error(
-                "--format must be 'text', 'binary', or 'json'");
+                "--format must be 'text' or 'json'");
         }
     }
 };
 
 struct RunCtx {
     const ClarionArgParse* cli = nullptr;
-
+    std::string find;
     std::vector<std::string> trace_files;
     std::vector<BucketMap> per_file;
     BucketMap merged;
@@ -755,7 +803,7 @@ coro::CoroTask<void> analyze_one(RunCtx* ctx, std::size_t index) {
     if (ctx->cli->aggregate) {
         dedup_forest(forest.roots);
     } else {
-        // hashes are part of the binary format and JSON args, so compute
+        // hashes are part of the JSON args, so compute
         // them even when not aggregating
         for (AggNode* r : forest.roots) compute_hash(r);
     }
@@ -839,7 +887,7 @@ coro::CoroTask<void> task_reduce(RunCtx* ctx) {
     co_return;
 }
 
-// ── write: text / binary / json ─────────────────────────────────────────────
+// ── write: text / json ─────────────────────────────────────────────
 
 void serialize_json_forest(const AggForest& forest, bool synthetic,
                            std::uint32_t pid, std::uint32_t tid,
@@ -879,36 +927,73 @@ coro::CoroTask<void> serialize_all_slices(CoroScope* child, RunCtx* ctx,
             if (format == OutputFormat::JSON) {
                 serialize_json_forest(f, synthetic, f.key.pid, f.key.tid,
                                       start_idx, (*buffers)[i]);
-            } else if (format == OutputFormat::TEXT) {
+            } else {
                 serialize_text_section(f, multi, (*buffers)[i]);
-            } else {  // BINARY: one standalone .call_tree blob per bucket
-                render_forest_binary(f.roots, (*buffers)[i]);
             }
             co_return;
         });
     }
     co_return;
 }
+coro::CoroTask<void> task_write_find(RunCtx* ctx) {
+    const OutputFormat format = ctx->cli->format;
+    const std::string& needle = ctx->cli->find;
 
-std::string binary_slice_path(const std::string& base, const ProcessKey& key,
-                              bool multi) {
-    if (!multi) return base;
-    std::string stem = base;
-    const std::string ext = ".call_tree";
-    if (stem.size() >= ext.size() &&
-        stem.compare(stem.size() - ext.size(), ext.size(), ext) == 0) {
-        stem.resize(stem.size() - ext.size());
+    std::vector<FoundNode> matches;
+    if (ctx->cli->global_merge) {
+        matches = find_in_forest(ctx->global_forest, needle);
+        for (FoundNode& m : matches) m.total_run_time = ctx->global_run_time;
+    } else {
+        for (const AggForest& f : ctx->forests) {
+            auto found = find_in_forest(f, needle);
+            matches.insert(matches.end(), found.begin(), found.end());
+        }
     }
-    char buf[96];
-    std::snprintf(buf, sizeof(buf), "_pid%u_tid%u_node%u", key.pid, key.tid,
-                  key.node_id);
-    return stem + buf + ext;
+
+    DFTRACER_UTILS_LOG_INFO("[find] \"%s\": %zu match(es)", needle.c_str(),
+                            matches.size());
+
+    if (format == OutputFormat::TEXT) {
+        std::string out;
+        render_matches_text(matches, needle,
+                            /*with_bucket_header=*/!ctx->cli->global_merge,
+                            out);
+        if (!write_file(ctx->output_path, out)) {
+            DFTRACER_UTILS_LOG_ERROR("failed to write %s",
+                                     ctx->output_path.c_str());
+            ctx->failed = true;
+            co_return;
+        }
+        std::printf("Output file: %s\n", ctx->output_path.c_str());
+        co_return;
+    }
+
+    // json / binary: one file per match
+    const bool synthetic = ctx->cli->aggregate;
+    const std::string ext = ".pfw";
+    for (std::size_t i = 0; i < matches.size(); ++i) {
+        const std::string body = render_match_json(matches[i], synthetic);
+                                     
+        const std::string path =
+            match_output_path(ctx->output_path, matches[i], i, ext);
+        if (!write_file(path, body)) {
+            DFTRACER_UTILS_LOG_ERROR("failed to write %s", path.c_str());
+            ctx->failed = true;
+            co_return;
+        }
+        std::printf("Output file: %s\n", path.c_str());
+    }
+    co_return;
 }
 
 coro::CoroTask<void> task_write(RunCtx* ctx, CoroScope* scope) {
     if (ctx->failed || ctx->cli->no_save) co_return;
     const OutputFormat format = ctx->cli->format;
 
+    if (!ctx->cli->find.empty()) {
+        co_await task_write_find(ctx);
+        co_return;
+    }
     // ── serialize ───────────────────────────────────────────────────────
     std::vector<std::string> slice_buffers;
     static constexpr std::uint64_t IDX_STRIDE = 1ull << 20;
@@ -921,9 +1006,7 @@ coro::CoroTask<void> task_write(RunCtx* ctx, CoroScope* scope) {
         } else if (format == OutputFormat::TEXT) {
             render_forest_text(ctx->global_forest.roots, ctx->global_run_time,
                                slice_buffers[0]);
-        } else {
-            render_forest_binary(ctx->global_forest.roots, slice_buffers[0]);
-        }
+        } 
     } else {
         slice_buffers.resize(ctx->forests.size());
         std::vector<std::string>* buffers_ptr = &slice_buffers;
@@ -936,28 +1019,7 @@ coro::CoroTask<void> task_write(RunCtx* ctx, CoroScope* scope) {
             });
     }
 
-    // ── binary: standalone file(s), ClarIOn-compatible ──────────────────
-    if (format == OutputFormat::BINARY) {
-        if (ctx->cli->gzip) {
-            DFTRACER_UTILS_LOG_WARN(
-                "%s", "--gzip is ignored for --format binary");
-        }
-        const bool multi = !ctx->cli->global_merge && slice_buffers.size() > 1;
-        for (std::size_t i = 0; i < slice_buffers.size(); ++i) {
-            const std::string path =
-                ctx->cli->global_merge
-                    ? ctx->output_path
-                    : binary_slice_path(ctx->output_path,
-                                        ctx->forests[i].key, multi);
-            if (!write_file(path, slice_buffers[i])) {
-                DFTRACER_UTILS_LOG_ERROR("failed to write %s", path.c_str());
-                ctx->failed = true;
-                co_return;
-            }
-            std::printf("Output file: %s\n", path.c_str());
-        }
-        co_return;
-    }
+    
 
     // ── text / json: ParallelWriter (sharded, optional gzip) ────────────
     std::string header;
@@ -1031,8 +1093,6 @@ const char* default_extension(OutputFormat format) {
     switch (format) {
         case OutputFormat::TEXT:
             return "call_tree.txt";
-        case OutputFormat::BINARY:
-            return ".call_tree";
         case OutputFormat::JSON:
             return ".pfw";
     }
@@ -1047,7 +1107,7 @@ int run(int argc, char** argv) {
     program.add_description(
         "Build per-process call trees from DFTracer traces (dftracer-style "
         "parallel ingestion) with ClarIOn hashing, aggregation, pruning, and "
-        "output formats (text tree, .call_tree binary, Chrome Tracing "
+        "output formats (text tree or Chrome Tracing "
         "JSON).");
 
     ClarionArgParse cli(program);
@@ -1070,11 +1130,11 @@ int run(int argc, char** argv) {
     } else {
         ctx.output_path = cli.output;
     }
-    if (cli.gzip && cli.format != OutputFormat::BINARY &&
-        (ctx.output_path.size() < 3 ||
-         ctx.output_path.compare(ctx.output_path.size() - 3, 3, ".gz") != 0)) {
-        ctx.output_path += ".gz";
-    }
+    // if (cli.gzip && cli.format != OutputFormat::BINARY &&
+    //     (ctx.output_path.size() < 3 ||
+    //      ctx.output_path.compare(ctx.output_path.size() - 3, 3, ".gz") != 0)) {
+    //     ctx.output_path += ".gz";
+    // }
 
     auto pipeline_config =
         cli::build_pipeline_config("ClarIOn CallTree", cli.pipeline);
