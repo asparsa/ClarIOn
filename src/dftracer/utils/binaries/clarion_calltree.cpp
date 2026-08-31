@@ -15,12 +15,37 @@
 //             dedup paths with equal hashes (--aggregate) and prune
 //             (--hotpath, --threshold). Buckets are independent, so this
 //             is fully parallel and events from different pids never mix.
+//             --detect-anomaly (implies --aggregate) flags two kinds of
+//             anomaly. A System Anomaly is found *during* this merge, at
+//             each same-name sibling merge candidate: two same-named
+//             siblings with different child sets (different execution
+//             paths) are left un-merged and flagged. A Performance Anomaly
+//             is found only *after* merging is fully done for a node: every
+//             individual occurrence's duration is collected onto the node
+//             as it merges (AggNode::perf_samples), and once a node has
+//             absorbed everything it ever will, each of its samples is
+//             compared against the mean of every *other* sample of that
+//             same call site (leave-one-out) and flagged if it deviates by
+//             more than --anomaly-threshold %% -- skipped when the baseline
+//             or the sample itself is below --anomaly-min-dur (trace
+//             timestamps are microsecond-resolution, so very short calls
+//             are mostly measurement noise). Once a node is itself flagged
+//             (either kind), anomalies already recorded for its descendants
+//             are removed -- a flagged ancestor suppresses the
+//             (now-redundant) nested findings, regardless of which kind
+//             either one is.
 // reduce    : (--global only) merge all per-bucket forests into one
-//             cross-process profile
+//             cross-process profile; also runs anomaly detection on the
+//             cross-bucket root merge when --detect-anomaly is set
 // write     : --format text   -> ClarIOn print_tree output
 //                                (dur/depth/count/min/max/mean, %% of
 //                                total/parent)
 //             --format json   -> Chrome Tracing JSON with agg stats in args
+//             --detect-anomaly -> also writes <output_stem>.anomalies.txt
+//                                with Performance Anomaly / System Anomaly
+//                                tables (function, ancestor, count, plus
+//                                expected_range/observed or the diverging
+//                                children and duration comparison)
 
 #include <dftracer/utils/call_tree/internal/process_key.h>
 #include <dftracer/utils/core/common/byte_view.h>
@@ -87,13 +112,23 @@ using BucketMap = std::unordered_map<ProcessKey, Bucket>;
 
 struct AggNode {
     std::string_view name;
-    std::uint64_t first_ts = 0;  
+    std::uint64_t first_ts = 0;
     long long dur = 0;           // inclusive, summed across merged occurrences
     long long count = 1;
     long long min = std::numeric_limits<long long>::max();
     long long max = std::numeric_limits<long long>::min();
     std::size_t hash = 0;
     std::vector<AggNode*> children;
+
+    // Every individual occurrence's own duration that has been folded into
+    // this node so far (always perf_samples.size() == count once merging is
+    // done). Only populated when --detect-anomaly is set (see
+    // project_bucket's track_perf_samples parameter) -- otherwise this stays
+    // empty and costs nothing. Kept so Performance Anomaly detection can run
+    // once, after a node has absorbed every occurrence it ever will, using
+    // the complete distribution rather than a running mean seen one
+    // occurrence at a time.
+    std::vector<long long> perf_samples;
 };
 
 struct AggForest {
@@ -114,6 +149,66 @@ struct AggForest {
                    ? static_cast<long long>(span_end - span_start)
                    : 0;
     }
+};
+
+// ── Anomaly detection model ─────────────────────────────────────────────────
+// Populated (opt-in, --detect-anomaly) at the exact point dedup_list
+// considers two same-named siblings for aggregation.
+
+struct PerfAnomaly {
+    std::string_view name;
+    std::string_view ancestor;      // root name of the tree this occurred in
+    int depth = 0;                  // depth of the node (root == 0)
+    long long count = 0;            // total occurrences of this node (i.e.
+                                     // node->perf_samples.size())
+    long long expected_low = 0;
+    long long expected_high = 0;
+    long long observed = 0;         // the one flagged occurrence's own dur
+    const AggNode* node = nullptr;  // identity of the flagged node, for
+                                     // descendant-suppression bookkeeping only
+                                     // (not rendered)
+};
+
+struct SysAnomaly {
+    std::string_view name;
+    std::string_view ancestor;
+    int depth = 0;                  // depth of the compared siblings (root == 0)
+    long long count = 0;
+    std::vector<std::string_view> only_in_existing;  // children only in dst
+    std::vector<std::string_view> only_in_incoming;  // children only in src
+    long long existing_dur = 0;
+    long long existing_count = 0;
+    long long incoming_dur = 0;
+    long long incoming_count = 0;
+    const AggNode* node = nullptr;  // identity of the flagged node, for
+                                     // descendant-suppression bookkeeping only
+                                     // (not rendered)
+    bool suppressed = false;        // see PerfAnomaly::suppressed
+};
+
+struct AnomalySink {
+    std::vector<PerfAnomaly> perf;
+    std::vector<SysAnomaly> sys;
+    double threshold_pct = 50.0;    // % deviation from mean; from CLI
+    long long min_samples = 3;      // don't flag a Performance Anomaly for a
+                                     // node until it has at least this many
+                                     // OTHER occurrences to compare against;
+                                     // from CLI
+    long long min_dur = 100;        // ignore Performance Anomaly comparisons
+                                     // where the leave-one-out mean or the
+                                     // observed duration is below this (raw
+                                     // trace time units, e.g. microseconds
+                                     // -- too short to be anything but
+                                     // timer/measurement noise); from CLI
+
+    // node -> indices of the (not-yet-necessarily-suppressed) entries in sys
+    // recorded with that exact node as `.node`. A node can appear more than
+    // once (e.g. it keeps diverging from different same-named siblings).
+    // Populated alongside sys, purely so suppress_descendant_anomalies can
+    // find "any System Anomaly already recorded under this specific
+    // subtree" in O(1) per node visited instead of rescanning the whole
+    // sink on every flag.
+    std::unordered_map<const AggNode*, std::vector<std::size_t>> sys_by_node;
 };
 
 // Order/multiplicity-independent structural hash (ClarIOn semantics),
@@ -146,6 +241,8 @@ void merge_subtree(AggNode* dst, AggNode* src) {
     dst->min = std::min(dst->min, src->min);
     dst->max = std::max(dst->max, src->max);
     dst->first_ts = std::min(dst->first_ts, src->first_ts);
+    dst->perf_samples.insert(dst->perf_samples.end(),
+                             src->perf_samples.begin(), src->perf_samples.end());
     for (AggNode* sc : src->children) {
         AggNode* match = nullptr;
         for (AggNode* dc : dst->children) {
@@ -163,8 +260,76 @@ void merge_subtree(AggNode* dst, AggNode* src) {
     src->children.clear();
 }
 
-void dedup_list(std::vector<AggNode*>& list) {
+// Same name, different child-hash set: same function took a different
+// execution path. Reports the child-name set difference; does NOT merge.
+// Returns whether an anomaly was recorded (always true today -- callers
+// only invoke this once they've already decided the two sides diverge --
+// kept as a return value for symmetry with check_perf_anomaly).
+bool record_sys_anomaly(AnomalySink* sink, const AggNode* existing,
+                        const AggNode* incoming, std::string_view root_name,
+                        int depth) {
+    std::unordered_set<std::string_view> ex_children, in_children;
+    for (const AggNode* c : existing->children) ex_children.insert(c->name);
+    for (const AggNode* c : incoming->children) in_children.insert(c->name);
+    SysAnomaly a;
+    a.name = existing->name;
+    a.ancestor = root_name;
+    a.depth = depth;
+    a.count = existing->count;
+    for (const AggNode* c : existing->children)
+        if (!in_children.count(c->name)) a.only_in_existing.push_back(c->name);
+    for (const AggNode* c : incoming->children)
+        if (!ex_children.count(c->name)) a.only_in_incoming.push_back(c->name);
+    a.existing_dur = existing->dur;
+    a.existing_count = existing->count;
+    a.incoming_dur = incoming->dur;
+    a.incoming_count = incoming->count;
+    a.node = existing;
+    sink->sys.push_back(std::move(a));
+    sink->sys_by_node[existing].push_back(sink->sys.size() - 1);
+    return true;
+}
+
+// Once a node is itself flagged with a System Anomaly, any System Anomaly
+// already recorded for one of its descendants is redundant noise -- the
+// ancestor's flag already explains it -- so mark it suppressed (dropped at
+// report time). This must run *before* `n` is folded into anything else via
+// merge_subtree: a merge can fold a flagged descendant's specific node
+// object into a sibling's, orphaning it from the live tree, so identifying
+// descendants has to happen against `n`'s current (not-yet-merged)
+// structure. Detection itself runs bottom-up (a node's descendants are
+// fully processed, and may already have been flagged, before the node is
+// compared to its own siblings), so this is necessarily a retroactive walk
+// rather than a check performed in advance -- but sink->sys_by_node turns
+// "was a System Anomaly already recorded against this specific node" into
+// an O(1) lookup, so the walk costs O(nodes visited) rather than O(sink
+// size) per flag. Performance Anomalies use a separate, later pass (see
+// detect_perf_anomalies) that runs once the tree is fully settled, so they
+// don't need this retroactive treatment -- but a Performance Anomaly found
+// there can still retroactively suppress a System Anomaly nested beneath
+// it, which is why this is reused from there too.
+void suppress_descendant_anomalies(AnomalySink* sink, const AggNode* n) {
+    for (const AggNode* c : n->children) {
+        auto sit = sink->sys_by_node.find(c);
+        if (sit != sink->sys_by_node.end())
+            for (std::size_t idx : sit->second) sink->sys[idx].suppressed = true;
+        suppress_descendant_anomalies(sink, c);
+    }
+}
+
+// `sink` is nullable: null means anomaly detection is off (no extra work
+// beyond the null checks below). `root_name` is the ancestor reported for
+// any anomaly found in this list (the enclosing tree's root name, or
+// "(top-level)" for a forest's own roots list); `depth` is the depth of the
+// siblings in `list` (root's own children are depth 1, forest roots are
+// depth 0). Only handles System Anomalies and the structural merge itself;
+// Performance Anomalies are detected in a separate later pass (see
+// detect_perf_anomalies) once every occurrence a node will ever absorb has
+// been merged into it.
+void dedup_list(std::vector<AggNode*>& list, AnomalySink* sink,
+                std::string_view root_name, int depth) {
     std::unordered_map<std::size_t, AggNode*> seen;
+    std::unordered_map<std::string_view, AggNode*> seen_by_name;
     std::vector<AggNode*> out;
     out.reserve(list.size());
     for (AggNode* n : list) {
@@ -172,6 +337,15 @@ void dedup_list(std::vector<AggNode*>& list) {
         if (it != seen.end() && subtrees_equal(it->second, n)) {
             merge_subtree(it->second, n);
         } else {
+            if (sink) {
+                auto nit = seen_by_name.find(n->name);
+                if (nit != seen_by_name.end() && nit->second->hash != n->hash &&
+                    record_sys_anomaly(sink, nit->second, n, root_name, depth)) {
+                    suppress_descendant_anomalies(sink, nit->second);
+                    suppress_descendant_anomalies(sink, n);
+                }
+                seen_by_name.emplace(n->name, n);
+            }
             seen.emplace(n->hash, n);
             out.push_back(n);
         }
@@ -179,17 +353,119 @@ void dedup_list(std::vector<AggNode*>& list) {
     list = std::move(out);
 }
 
-void dedup_tree(AggNode* n) {
-    for (AggNode* c : n->children) dedup_tree(c);
-    dedup_list(n->children);
+void dedup_tree(AggNode* n, AnomalySink* sink, std::string_view root_name,
+               int depth) {
+    for (AggNode* c : n->children) dedup_tree(c, sink, root_name, depth + 1);
+    dedup_list(n->children, sink, root_name, depth + 1);
 }
 
-void dedup_forest(std::vector<AggNode*>& roots) {
+void dedup_forest(std::vector<AggNode*>& roots, AnomalySink* sink) {
     for (AggNode* r : roots) {
         compute_hash(r);
-        dedup_tree(r);
+        dedup_tree(r, sink, r->name, /*depth=*/0);
     }
-    dedup_list(roots);
+    dedup_list(roots, sink, "(top-level)", /*depth=*/0);
+}
+
+// Performance Anomaly detection, run once per node *after* it has absorbed
+// every occurrence it's ever going to (i.e. after dedup_forest/dedup_list
+// has fully settled the tree this node lives in) -- unlike the old design,
+// which compared each incoming occurrence against a running mean built from
+// only the occurrences merged so far, this uses the complete distribution:
+// checks `n`'s own perf_samples only (no recursion into children; the
+// recursive walk over the whole tree lives in detect_perf_anomalies_node
+// below). Skipped per-node while there are fewer than sink->min_samples
+// samples total (a baseline built from 1-2 points has no real variance
+// behind it), and skipped per-sample when either the baseline or the
+// sample itself is below sink->min_dur (trace timestamps are
+// microsecond-resolution, so very short calls are mostly measurement
+// noise). Returns whether `n` itself was flagged, and -- since it was --
+// has already suppressed any System Anomaly nested beneath it (cross-kind
+// suppression against System Anomalies detected earlier, during
+// dedup_forest, is finalized in detect_perf_anomalies_node below).
+//
+// The baseline is the *median* of all of `n`'s samples, not the mean: a
+// leave-one-out mean was tried first and doesn't work here -- with a single
+// dominant outlier, every *other* sample's own baseline still includes that
+// outlier in its sum, dragging their expected mean upward and making the
+// perfectly normal samples look anomalously *low* by comparison (one real
+// spike turns into a cascade of spurious "too low" findings alongside it).
+// The median barely moves in the presence of one (or a few) extreme values,
+// so it stays representative of "what this call site normally costs" and
+// doesn't fall into that trap; every sample is compared against that same
+// single median-based band.
+bool detect_perf_anomaly_self(AnomalySink* sink, AggNode* n,
+                              std::string_view ancestor_label, int depth) {
+    const long long count = static_cast<long long>(n->perf_samples.size());
+    if (count < sink->min_samples) return false;
+    std::vector<long long> sorted = n->perf_samples;
+    std::sort(sorted.begin(), sorted.end());
+    const double median =
+        (count % 2 == 0)
+            ? (static_cast<double>(sorted[count / 2 - 1]) +
+              static_cast<double>(sorted[count / 2])) / 2.0
+            : static_cast<double>(sorted[count / 2]);
+    if (median < static_cast<double>(sink->min_dur)) return false;
+    const double low = median * (1.0 - sink->threshold_pct / 100.0);
+    const double high = median * (1.0 + sink->threshold_pct / 100.0);
+    bool flagged = false;
+    for (long long d : n->perf_samples) {
+        if (static_cast<double>(d) < static_cast<double>(sink->min_dur))
+            continue;
+        if (static_cast<double>(d) < low || static_cast<double>(d) > high) {
+            sink->perf.push_back(PerfAnomaly{n->name, ancestor_label, depth,
+                count, static_cast<long long>(low),
+                static_cast<long long>(high), d, n});
+            flagged = true;
+        }
+    }
+    if (flagged) suppress_descendant_anomalies(sink, n);
+    return flagged;
+}
+
+void detect_perf_anomalies_node(AnomalySink* sink, AggNode* n,
+                                std::string_view own_root_name, int depth,
+                                bool ancestor_flagged) {
+    // The node's own comparison uses "(top-level)" as its ancestor label at
+    // depth 0 (matching System Anomaly's root-vs-root convention); every
+    // deeper node is anchored to the root's own name.
+    const std::string_view ancestor_label =
+        depth == 0 ? std::string_view("(top-level)") : own_root_name;
+
+    const bool self_flagged =
+        !ancestor_flagged &&
+        detect_perf_anomaly_self(sink, n, ancestor_label, depth);
+
+    bool has_live_sys = false;
+    if (!ancestor_flagged && !self_flagged) {
+        auto sit = sink->sys_by_node.find(n);
+        if (sit != sink->sys_by_node.end())
+            for (std::size_t idx : sit->second)
+                if (!sink->sys[idx].suppressed) { has_live_sys = true; break; }
+    }
+    const bool next_ancestor_flagged =
+        ancestor_flagged || self_flagged || has_live_sys;
+    for (AggNode* c : n->children)
+        detect_perf_anomalies_node(sink, c, own_root_name, depth + 1,
+                                   next_ancestor_flagged);
+}
+
+void detect_perf_anomalies(AnomalySink* sink, const std::vector<AggNode*>& roots) {
+    for (AggNode* r : roots)
+        detect_perf_anomalies_node(sink, r, r->name, /*depth=*/0,
+                                   /*ancestor_flagged=*/false);
+}
+
+// For the --global cross-bucket reduce step: only the roots themselves can
+// have picked up additional occurrences there (deeper nodes are untouched
+// by the cross-bucket merge, and were already fully detected per-bucket via
+// detect_perf_anomalies above), so only their own samples need re-checking
+// -- recursing into children would re-detect, and duplicate, findings
+// already recorded at the bucket level.
+void detect_perf_anomalies_roots_only(AnomalySink* sink,
+                                      const std::vector<AggNode*>& roots) {
+    for (AggNode* r : roots)
+        detect_perf_anomaly_self(sink, r, "(top-level)", /*depth=*/0);
 }
 
 void prune_hot_paths(AggNode* node, double threshold_pct) {
@@ -263,8 +539,13 @@ void prune_threshold_forest(std::vector<AggNode*>& roots, double threshold_pct,
 // Nesting is inferred ClarIOn-style from time-span containment (sort by
 // start time, outer interval first on ties, then a single stack sweep).
 
+// `track_perf_samples` (== --detect-anomaly) seeds each node's own
+// perf_samples with its single initial occurrence; merge_subtree then
+// concatenates these as nodes fold together, so every node ends up with the
+// full duration list of everything it ever absorbed. Left false, this stays
+// empty and costs nothing -- most runs don't need it.
 void project_bucket(const Bucket& events, bool inclusive_containment,
-                    AggForest& forest) {
+                    AggForest& forest, bool track_perf_samples) {
     struct Span {
         AggNode* node;
         std::uint64_t ts;
@@ -281,6 +562,7 @@ void project_bucket(const Bucket& events, bool inclusive_containment,
         n->count = 1;
         n->min = n->dur;
         n->max = n->dur;
+        if (track_perf_samples) n->perf_samples.push_back(n->dur);
 
         const std::uint64_t te = e.ts + e.dur;
         forest.span_start = std::min(forest.span_start, e.ts);
@@ -319,6 +601,7 @@ AggNode* deep_copy(const AggNode* src, AggForest& into) {
     c->min = src->min;
     c->max = src->max;
     c->hash = src->hash;
+    c->perf_samples = src->perf_samples;
     c->children.reserve(src->children.size());
     for (const AggNode* sc : src->children)
         c->children.push_back(deep_copy(sc, into));
@@ -393,6 +676,110 @@ bool write_file(const std::string& path, const std::string& bytes) {
         std::fwrite(bytes.data(), 1, bytes.size(), f) == bytes.size();
     std::fclose(f);
     return ok;
+}
+
+// ── Anomaly report (plain text tables) ──────────────────────────────────────
+
+std::string join_names(const std::vector<std::string_view>& names) {
+    if (names.empty()) return "-";
+    std::string out;
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        if (i) out += ',';
+        out.append(names[i].data(), names[i].size());
+    }
+    return out;
+}
+
+void render_table(const std::vector<std::string>& headers,
+                  const std::vector<std::vector<std::string>>& rows,
+                  std::string& out) {
+    std::vector<std::size_t> widths(headers.size());
+    for (std::size_t c = 0; c < headers.size(); ++c) widths[c] = headers[c].size();
+    for (const auto& row : rows)
+        for (std::size_t c = 0; c < row.size(); ++c)
+            widths[c] = std::max(widths[c], row[c].size());
+
+    auto emit_row = [&](const std::vector<std::string>& cells) {
+        for (std::size_t c = 0; c < cells.size(); ++c) {
+            out += cells[c];
+            out.append(widths[c] - cells[c].size() + 2, ' ');
+        }
+        out += '\n';
+    };
+    emit_row(headers);
+    std::size_t total_width = 0;
+    for (std::size_t w : widths) total_width += w + 2;
+    out.append(total_width, '-');
+    out += '\n';
+    for (const auto& row : rows) emit_row(row);
+}
+
+void render_perf_anomalies(const std::vector<PerfAnomaly>& items,
+                          std::string& out) {
+    out += "=== Performance Anomalies (" + std::to_string(items.size()) +
+          ") ===\n";
+    if (items.empty()) {
+        out += "(none)\n";
+        return;
+    }
+    const std::vector<std::string> headers{"function", "ancestor", "depth",
+                                           "count", "expected_range",
+                                           "observed"};
+    std::vector<std::vector<std::string>> rows;
+    rows.reserve(items.size());
+    for (const PerfAnomaly& a : items) {
+        rows.push_back({std::string(a.name), std::string(a.ancestor),
+                        std::to_string(a.depth), std::to_string(a.count),
+                        "[" + std::to_string(a.expected_low) + ", " +
+                            std::to_string(a.expected_high) + "]",
+                        std::to_string(a.observed)});
+    }
+    render_table(headers, rows, out);
+}
+
+void render_sys_anomalies(const std::vector<SysAnomaly>& items,
+                          std::string& out) {
+    out += "=== System Anomalies (" + std::to_string(items.size()) +
+          ") ===\n";
+    if (items.empty()) {
+        out += "(none)\n";
+        return;
+    }
+    const std::vector<std::string> headers{
+        "function",          "ancestor",           "depth",
+        "count",             "only_in_existing",   "only_in_incoming",
+        "existing(dur/count)", "incoming(dur/count)"};
+    std::vector<std::vector<std::string>> rows;
+    rows.reserve(items.size());
+    for (const SysAnomaly& a : items) {
+        rows.push_back({std::string(a.name), std::string(a.ancestor),
+                        std::to_string(a.depth), std::to_string(a.count),
+                        join_names(a.only_in_existing),
+                        join_names(a.only_in_incoming),
+                        std::to_string(a.existing_dur) + "/" +
+                            std::to_string(a.existing_count),
+                        std::to_string(a.incoming_dur) + "/" +
+                            std::to_string(a.incoming_count)});
+    }
+    render_table(headers, rows, out);
+}
+
+// System Anomalies suppressed by an already-flagged ancestor (see
+// suppress_descendant_anomalies) are kept in the sink -- tombstoned, not
+// erased, to keep suppression itself cheap -- so this drops them in one
+// linear pass before rendering. Performance Anomalies need no such filter:
+// detect_perf_anomalies only ever pushes ones that survive suppression.
+std::string render_anomaly_report(const AnomalySink& sink) {
+    std::vector<SysAnomaly> sys;
+    sys.reserve(sink.sys.size());
+    for (const SysAnomaly& a : sink.sys)
+        if (!a.suppressed) sys.push_back(a);
+
+    std::string out;
+    render_perf_anomalies(sink.perf, out);
+    out += '\n';
+    render_sys_anomalies(sys, out);
+    return out;
 }
 
 // ── JSON output (Chrome Tracing) ────────────────────────────────────────────
@@ -553,6 +940,17 @@ std::string match_output_path(const std::string& base, const FoundNode& match,
     std::snprintf(buf, sizeof(buf), "_%zu", index);
     return stem + "_" + name + buf + ext;
 }
+
+// <output_stem>.anomalies.txt, stripping a trailing "."-delimited extension
+// (the part of output_path after the last '.' that follows the last '/').
+std::string anomaly_report_path(const std::string& output_path) {
+    std::string stem = output_path;
+    const auto pos = stem.find_last_of('.');
+    const auto slash = stem.find_last_of('/');
+    if (pos != std::string::npos && (slash == std::string::npos || pos > slash))
+        stem.resize(pos);
+    return stem + ".anomalies.txt";
+}
 // ── CLI / pipeline plumbing ─────────────────────────────────────────────────
 
 class ClarionArgParse : public cli::ArgParse {
@@ -571,6 +969,10 @@ class ClarionArgParse : public cli::ArgParse {
     bool hotpath = false;
     double hotpath_threshold = 50.0;
     double threshold = -1.0;
+    bool detect_anomaly = false;
+    double anomaly_threshold = 50.0;
+    long long anomaly_min_samples = 3;
+    long long anomaly_min_dur = 100;
     OutputFormat format = OutputFormat::TEXT;
 
     explicit ClarionArgParse(argparse::ArgumentParser& p) : ArgParse(p) {
@@ -631,6 +1033,34 @@ class ClarionArgParse : public cli::ArgParse {
             .add_argument("--find")
             .help("Find a specific node in the call tree")
             .default_value<std::string>("");
+        parser()
+            .add_argument("--detect-anomaly")
+            .help("Flag performance outliers and structural divergences "
+                  "among aggregation candidates as <output>.anomalies.txt "
+                  "(implies --aggregate)")
+            .flag();
+        parser()
+            .add_argument("--anomaly-threshold")
+            .help("%% deviation from mean duration that flags a Performance "
+                  "Anomaly")
+            .default_value<double>(50.0)
+            .scan<'g', double>();
+        parser()
+            .add_argument("--anomaly-min-samples")
+            .help("Don't flag a Performance Anomaly for a call site until it "
+                  "has at least this many OTHER recorded occurrences to "
+                  "compare against (guards against false positives from a "
+                  "baseline built on too few samples)")
+            .default_value<long long>(3)
+            .scan<'d', long long>();
+        parser()
+            .add_argument("--anomaly-min-dur")
+            .help("Ignore Performance Anomaly comparisons where the "
+                  "baseline or observed duration is below this (raw trace "
+                  "time units, e.g. microseconds) -- too short to be "
+                  "anything but measurement noise")
+            .default_value<long long>(100)
+            .scan<'d', long long>();
     }
 
     void post_parse() override {
@@ -647,6 +1077,11 @@ class ClarionArgParse : public cli::ArgParse {
         find = parser().get<std::string>("--find");
         threshold = parser().get<double>("--threshold");
         if (global_merge) aggregate = true;
+        detect_anomaly = parser().get<bool>("--detect-anomaly");
+        anomaly_threshold = parser().get<double>("--anomaly-threshold");
+        anomaly_min_samples = parser().get<long long>("--anomaly-min-samples");
+        anomaly_min_dur = parser().get<long long>("--anomaly-min-dur");
+        if (detect_anomaly) aggregate = true;
 
         const std::string fmt = parser().get<std::string>("--format");
         if (fmt == "text") {
@@ -671,6 +1106,9 @@ struct RunCtx {
     std::vector<AggForest> forests;  // one per bucket
     AggForest global_forest;         // used with --global
     long long global_run_time = 0;
+
+    std::vector<AnomalySink> bucket_anomalies;  // one per bucket, filled in task_analyze
+    AnomalySink anomalies;                      // flattened across buckets + global reduce
 
     std::string output_path;
     bool failed = false;
@@ -790,18 +1228,21 @@ coro::CoroTask<void> task_merge(RunCtx* ctx) {
 
 // analyze: containment nesting + hash + dedup + prune, one bucket per
 // coroutine
-coro::CoroTask<void> analyze_one(RunCtx* ctx, std::size_t index) {
+coro::CoroTask<void> analyze_one(RunCtx* ctx, std::size_t index,
+                                 AnomalySink* sink) {
     const ProcessKey key = ctx->process_keys[index];
     AggForest& forest = ctx->forests[index];
     forest.key = key;
 
     auto it = ctx->merged.find(key);
     if (it == ctx->merged.end()) co_return;
-    project_bucket(it->second, !ctx->cli->time_exclusive, forest);
+    project_bucket(it->second, !ctx->cli->time_exclusive, forest,
+                   ctx->cli->detect_anomaly);
 
     const std::size_t before = forest.pool.size();
     if (ctx->cli->aggregate) {
-        dedup_forest(forest.roots);
+        dedup_forest(forest.roots, sink);
+        if (sink) detect_perf_anomalies(sink, forest.roots);
     } else {
         // hashes are part of the JSON args, so compute
         // them even when not aggregating
@@ -835,7 +1276,9 @@ coro::CoroTask<void> analyze_one(RunCtx* ctx, std::size_t index) {
 coro::CoroTask<void> analyze_all(CoroScope* child, RunCtx* ctx) {
     for (std::size_t i = 0; i < ctx->process_keys.size(); ++i) {
         child->spawn([ctx, i](CoroScope&) mutable -> coro::CoroTask<void> {
-            co_await analyze_one(ctx, i);
+            AnomalySink* sink =
+                ctx->cli->detect_anomaly ? &ctx->bucket_anomalies[i] : nullptr;
+            co_await analyze_one(ctx, i, sink);
         });
     }
     co_return;
@@ -845,11 +1288,37 @@ coro::CoroTask<void> task_analyze(RunCtx* ctx, CoroScope* scope) {
     if (ctx->failed) co_return;
     ctx->forests.clear();
     ctx->forests.resize(ctx->process_keys.size());
+    if (ctx->cli->detect_anomaly) {
+        ctx->bucket_anomalies.clear();
+        ctx->bucket_anomalies.resize(ctx->process_keys.size());
+        for (AnomalySink& s : ctx->bucket_anomalies) {
+            s.threshold_pct = ctx->cli->anomaly_threshold;
+            s.min_samples = ctx->cli->anomaly_min_samples;
+            s.min_dur = ctx->cli->anomaly_min_dur;
+        }
+        ctx->anomalies.threshold_pct = ctx->cli->anomaly_threshold;
+        ctx->anomalies.min_samples = ctx->cli->anomaly_min_samples;
+        ctx->anomalies.min_dur = ctx->cli->anomaly_min_dur;
+    }
     RunCtx* ctx_ptr = ctx;
     co_await scope->scope(
         [ctx_ptr](CoroScope& child) mutable -> coro::CoroTask<void> {
             co_await analyze_all(&child, ctx_ptr);
         });
+
+    // per-bucket coroutines have all completed (scope closed above), so
+    // this sequential fold needs no locking.
+    if (ctx->cli->detect_anomaly) {
+        for (AnomalySink& s : ctx->bucket_anomalies) {
+            ctx->anomalies.perf.insert(ctx->anomalies.perf.end(),
+                                       std::make_move_iterator(s.perf.begin()),
+                                       std::make_move_iterator(s.perf.end()));
+            ctx->anomalies.sys.insert(ctx->anomalies.sys.end(),
+                                      std::make_move_iterator(s.sys.begin()),
+                                      std::make_move_iterator(s.sys.end()));
+        }
+        ctx->bucket_anomalies.clear();
+    }
     co_return;
 }
 
@@ -872,7 +1341,12 @@ coro::CoroTask<void> task_reduce(RunCtx* ctx) {
         span_end > span_start ? static_cast<long long>(span_end - span_start)
                               : 0;
 
-    dedup_list(ctx->global_forest.roots);
+    dedup_list(ctx->global_forest.roots,
+              ctx->cli->detect_anomaly ? &ctx->anomalies : nullptr,
+              "(top-level)", /*depth=*/0);
+    if (ctx->cli->detect_anomaly)
+        detect_perf_anomalies_roots_only(&ctx->anomalies,
+                                         ctx->global_forest.roots);
     if (ctx->cli->hotpath)
         prune_hot_paths_forest(ctx->global_forest.roots,
                                ctx->cli->hotpath_threshold);
@@ -989,6 +1463,17 @@ coro::CoroTask<void> task_write_find(RunCtx* ctx) {
 coro::CoroTask<void> task_write(RunCtx* ctx, CoroScope* scope) {
     if (ctx->failed || ctx->cli->no_save) co_return;
     const OutputFormat format = ctx->cli->format;
+
+    if (ctx->cli->detect_anomaly) {
+        const std::string report = render_anomaly_report(ctx->anomalies);
+        const std::string path = anomaly_report_path(ctx->output_path);
+        if (!write_file(path, report)) {
+            DFTRACER_UTILS_LOG_ERROR("failed to write %s", path.c_str());
+            ctx->failed = true;
+            co_return;
+        }
+        std::printf("Anomaly report: %s\n", path.c_str());
+    }
 
     if (!ctx->cli->find.empty()) {
         co_await task_write_find(ctx);

@@ -216,6 +216,7 @@ set(TEST_BINARY_SOURCES
     binaries/test_dftracer_replay.cpp
     binaries/test_dftracer_comparator.cpp
     binaries/test_dftracer_call_tree.cpp
+    binaries/test_clarion_calltree.cpp
     )
 
 if(DFTRACER_UTILS_ENABLE_MPI)
@@ -334,6 +335,9 @@ foreach(test_file ${TEST_BINARY_SOURCES})
   elseif(bin_exec STREQUAL "binaries/test_dftracer_call_tree")
     set_tests_properties(${bin_exec} PROPERTIES ENVIRONMENT
       "DFTRACER_CALL_TREE_PATH=$<TARGET_FILE:dftracer_call_tree>")
+  elseif(bin_exec STREQUAL "binaries/test_clarion_calltree")
+    set_tests_properties(${bin_exec} PROPERTIES ENVIRONMENT
+      "CLARION_CALLTREE_PATH=$<TARGET_FILE:clarion_calltree>")
   elseif(bin_exec STREQUAL "binaries/test_dftracer_call_tree_mpi")
     set_tests_properties(${bin_exec} PROPERTIES ENVIRONMENT
       "DFTRACER_CALL_TREE_PATH=$<TARGET_FILE:dftracer_call_tree>;DFTRACER_CALL_TREE_MPI_PATH=$<TARGET_FILE:dftracer_call_tree_mpi>;MPIEXEC_EXECUTABLE=${MPIEXEC_EXECUTABLE};ASAN_OPTIONS=detect_leaks=0;LSAN_OPTIONS=detect_leaks=0")
