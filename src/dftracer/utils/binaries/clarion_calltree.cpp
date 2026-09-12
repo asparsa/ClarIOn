@@ -106,10 +106,6 @@ struct RawEvent {
 using Bucket = std::vector<RawEvent>;
 using BucketMap = std::unordered_map<ProcessKey, Bucket>;
 
-// ────────────────────────────────────────────────────────────────────────────
-// Aggregation model (ported from ClarIOn's Node, minus pid-blindness).
-// ────────────────────────────────────────────────────────────────────────────
-
 struct AggNode {
     std::string_view name;
     std::uint64_t first_ts = 0;
@@ -608,11 +604,27 @@ AggNode* deep_copy(const AggNode* src, AggForest& into) {
     return c;
 }
 
+// Converts every node's dur from inclusive (as recorded/aggregated) to
+// exclusive/self time: each node's dur becomes its own inclusive dur minus
+// the summed dur of its (surviving) children. Must run last, after any
+// aggregation/hotpath/threshold pruning -- that way a child dropped by
+// pruning folds its time into its parent's self time instead of the time
+// simply vanishing from the tree.
+void apply_exclusive_time(const std::vector<AggNode*>& nodes) {
+    for (AggNode* n : nodes) {
+        long long children_total = 0;
+        for (const AggNode* c : n->children) children_total += c->dur;
+        n->dur = std::max<long long>(0, n->dur - children_total);
+        apply_exclusive_time(n->children);
+    }
+}
+
 // ── Text output (byte-for-byte ClarIOn print_tree format) ──────────────────
 
 void render_tree_nodes(const std::vector<AggNode*>& nodes,
                        long long total_run_time, const std::string& prefix,
-                       long long parent_dur, int depth, std::string& out) {
+                       long long parent_dur, int depth, bool show_parent_pct,
+                       std::string& out) {
     const std::size_t n = nodes.size();
     char buf[512];
     for (std::size_t i = 0; i < n; ++i) {
@@ -643,7 +655,7 @@ void render_tree_nodes(const std::vector<AggNode*>& nodes,
                               100.0 * static_cast<double>(node->dur) /
                                   static_cast<double>(total_run_time));
             out.append(buf, static_cast<std::size_t>(w));
-        } else if (parent_dur > 0) {
+        } else if (parent_dur > 0 && show_parent_pct) {
             w = std::snprintf(buf, sizeof(buf), " [%.2f%% of parent]",
                               100.0 * static_cast<double>(node->dur) /
                                   static_cast<double>(parent_dur));
@@ -654,18 +666,20 @@ void render_tree_nodes(const std::vector<AggNode*>& nodes,
         if (!node->children.empty()) {
             std::string new_prefix = prefix + ((i == n - 1) ? "    " : "│   ");
             render_tree_nodes(node->children, total_run_time, new_prefix,
-                              node->dur, depth + 1, out);
+                              node->dur, depth + 1, show_parent_pct, out);
         }
     }
 }
 
 void render_forest_text(const std::vector<AggNode*>& roots,
-                        long long total_run_time, std::string& out) {
+                        long long total_run_time, bool show_parent_pct,
+                        std::string& out) {
     char buf[128];
     int w = std::snprintf(buf, sizeof(buf), " Total run time: %lld \n",
                           total_run_time);
     out.append(buf, static_cast<std::size_t>(w));
-    render_tree_nodes(roots, total_run_time, std::string(""), -1, 0, out);
+    render_tree_nodes(roots, total_run_time, std::string(""), -1, 0,
+                      show_parent_pct, out);
 }
 
 
@@ -871,7 +885,7 @@ std::vector<FoundNode> find_in_forest(const AggForest& forest,
 // text: every match rendered as its own tree, one after another.
 void render_matches_text(const std::vector<FoundNode>& matches,
                          std::string_view needle, bool with_bucket_header,
-                         std::string& out) {
+                         bool show_parent_pct, std::string& out) {
     char buf[256];
     if (matches.empty()) {
         int w = std::snprintf(buf, sizeof(buf), "No match for \"%.*s\"\n",
@@ -894,7 +908,7 @@ void render_matches_text(const std::vector<FoundNode>& matches,
         // one-element forest: the match is the root, so its line carries
         // "% of total" and its descendants "% of parent"
         const std::vector<AggNode*> root{const_cast<AggNode*>(m.node)};
-        render_forest_text(root, m.total_run_time, out);
+        render_forest_text(root, m.total_run_time, show_parent_pct, out);
         out += '\n';
     }
 }
@@ -963,6 +977,7 @@ class ClarionArgParse : public cli::ArgParse {
     std::string find;
     bool no_save = false;
     bool gzip = false;
+    bool strict_nesting = false;
     bool time_exclusive = false;
     bool aggregate = false;
     bool global_merge = false;
@@ -996,9 +1011,16 @@ class ClarionArgParse : public cli::ArgParse {
             .help("gzip the output (text/json only)")
             .flag();
         parser()
+            .add_argument("-n", "--strict-nesting")
+            .help("Strict (exclusive-bound) containment when "
+                  "reconstructing nesting from overlapping-timestamp spans "
+                  "(default: inclusive bounds)")
+            .flag();
+        parser()
             .add_argument("-t", "--time-exclusive")
-            .help("Exclusive time containment when nesting "
-                  "(default: inclusive)")
+            .help("Report exclusive (self) time: each node's duration minus "
+                  "the summed duration of its children (default: inclusive, "
+                  "i.e. each node's duration includes its children's)")
             .flag();
         parser()
             .add_argument("-f", "--format")
@@ -1069,6 +1091,7 @@ class ClarionArgParse : public cli::ArgParse {
         output = parser().get<std::string>("--output");
         no_save = parser().get<bool>("--no-save");
         gzip = parser().get<bool>("--gzip");
+        strict_nesting = parser().get<bool>("--strict-nesting");
         time_exclusive = parser().get<bool>("--time-exclusive");
         aggregate = parser().get<bool>("--aggregate");
         global_merge = parser().get<bool>("--global");
@@ -1236,7 +1259,7 @@ coro::CoroTask<void> analyze_one(RunCtx* ctx, std::size_t index,
 
     auto it = ctx->merged.find(key);
     if (it == ctx->merged.end()) co_return;
-    project_bucket(it->second, !ctx->cli->time_exclusive, forest,
+    project_bucket(it->second, !ctx->cli->strict_nesting, forest,
                    ctx->cli->detect_anomaly);
 
     const std::size_t before = forest.pool.size();
@@ -1375,7 +1398,7 @@ void serialize_json_forest(const AggForest& forest, bool synthetic,
 }
 
 void serialize_text_section(const AggForest& forest, bool with_header,
-                            std::string& out) {
+                            bool show_parent_pct, std::string& out) {
     if (with_header) {
         char buf[128];
         int w = std::snprintf(buf, sizeof(buf),
@@ -1383,7 +1406,8 @@ void serialize_text_section(const AggForest& forest, bool with_header,
                               forest.key.tid, forest.key.node_id);
         out.append(buf, static_cast<std::size_t>(w));
     }
-    render_forest_text(forest.roots, forest.total_run_time(), out);
+    render_forest_text(forest.roots, forest.total_run_time(), show_parent_pct,
+                       out);
     if (with_header) out += '\n';
 }
 
@@ -1402,7 +1426,8 @@ coro::CoroTask<void> serialize_all_slices(CoroScope* child, RunCtx* ctx,
                 serialize_json_forest(f, synthetic, f.key.pid, f.key.tid,
                                       start_idx, (*buffers)[i]);
             } else {
-                serialize_text_section(f, multi, (*buffers)[i]);
+                serialize_text_section(f, multi, !ctx->cli->time_exclusive,
+                                       (*buffers)[i]);
             }
             co_return;
         });
@@ -1431,6 +1456,7 @@ coro::CoroTask<void> task_write_find(RunCtx* ctx) {
         std::string out;
         render_matches_text(matches, needle,
                             /*with_bucket_header=*/!ctx->cli->global_merge,
+                            /*show_parent_pct=*/!ctx->cli->time_exclusive,
                             out);
         if (!write_file(ctx->output_path, out)) {
             DFTRACER_UTILS_LOG_ERROR("failed to write %s",
@@ -1475,6 +1501,14 @@ coro::CoroTask<void> task_write(RunCtx* ctx, CoroScope* scope) {
         std::printf("Anomaly report: %s\n", path.c_str());
     }
 
+    // Self time is derived from each node's final (post-pruning) children,
+    // so this runs last, right before anything reads node->dur to render.
+    if (ctx->cli->time_exclusive) {
+        for (AggForest& f : ctx->forests) apply_exclusive_time(f.roots);
+        if (ctx->cli->global_merge)
+            apply_exclusive_time(ctx->global_forest.roots);
+    }
+
     if (!ctx->cli->find.empty()) {
         co_await task_write_find(ctx);
         co_return;
@@ -1490,8 +1524,8 @@ coro::CoroTask<void> task_write(RunCtx* ctx, CoroScope* scope) {
                                   /*pid=*/0, /*tid=*/0, 0, slice_buffers[0]);
         } else if (format == OutputFormat::TEXT) {
             render_forest_text(ctx->global_forest.roots, ctx->global_run_time,
-                               slice_buffers[0]);
-        } 
+                               !ctx->cli->time_exclusive, slice_buffers[0]);
+        }
     } else {
         slice_buffers.resize(ctx->forests.size());
         std::vector<std::string>* buffers_ptr = &slice_buffers;
