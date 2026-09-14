@@ -952,6 +952,9 @@ coro::CoroTask<void> task_write(RunCtx* ctx) {
         ctx->failed = true;
         co_return;
     }
+    if (cli.format == DiffFormat::TEXT) {
+        std::fwrite(out.data(), 1, out.size(), stdout);
+    }
     std::printf("Output file: %s\n", path.c_str());
     co_return;
 }
