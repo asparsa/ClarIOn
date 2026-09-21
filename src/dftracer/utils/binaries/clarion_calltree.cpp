@@ -99,6 +99,7 @@ StringIntern& name_intern() {
 
 struct RawEvent {
     std::string_view name;
+    std::string_view cat;
     std::uint64_t ts = 0;
     std::uint64_t dur = 0;
 };
@@ -108,6 +109,7 @@ using BucketMap = std::unordered_map<ProcessKey, Bucket>;
 
 struct AggNode {
     std::string_view name;
+    std::string_view cat;
     std::uint64_t first_ts = 0;
     long long dur = 0;           // inclusive, summed across merged occurrences
     long long count = 1;
@@ -553,6 +555,7 @@ void project_bucket(const Bucket& events, bool inclusive_containment,
     for (const RawEvent& e : events) {
         AggNode* n = forest.make();
         n->name = e.name;
+        n->cat = e.cat;
         n->first_ts = e.ts;
         n->dur = static_cast<long long>(e.dur);
         n->count = 1;
@@ -591,6 +594,7 @@ void project_bucket(const Bucket& events, bool inclusive_containment,
 AggNode* deep_copy(const AggNode* src, AggForest& into) {
     AggNode* c = into.make();
     c->name = src->name;
+    c->cat = src->cat;
     c->first_ts = src->first_ts;
     c->dur = src->dur;
     c->count = src->count;
@@ -841,9 +845,11 @@ void serialize_agg(const AggNode* n, std::uint64_t start, int depth,
         "{\"id\":%llu,\"name\":\"", static_cast<unsigned long long>(idx++));
     out.append(buf, static_cast<std::size_t>(w));
     append_escaped(out, n->name);
+    out.append("\",\"cat\":\"", 9);
+    append_escaped(out, n->cat.empty() ? std::string_view("clarion") : n->cat);
     w = std::snprintf(
         buf, sizeof(buf),
-        "\",\"cat\":\"clarion\",\"pid\":%u,\"tid\":%u,\"ts\":%llu,"
+        "\",\"pid\":%u,\"tid\":%u,\"ts\":%llu,"
         "\"dur\":%lld,\"ph\":\"X\",\"args\":{\"count\":%lld,\"min\":%lld,"
         "\"max\":%lld,\"mean\":%lld,\"hash\":%zu,\"depth\":%d}},\n",
         pid, tid, static_cast<unsigned long long>(ts), n->dur, n->count,
@@ -913,13 +919,18 @@ void render_matches_text(const std::vector<FoundNode>& matches,
     }
 }
 
-// json: a complete Chrome Tracing document for a single match.
-std::string render_match_json(const FoundNode& match, bool synthetic) {
+// json: a complete Chrome Tracing document for a single match. The header
+// marker row identifies the search rather than any one function -- its name
+// is the search term and its cat is the literal "find" -- while every node
+// event below it keeps that node's own original cat (see serialize_agg).
+std::string render_match_json(const FoundNode& match, std::string_view needle,
+                              bool synthetic) {
     std::string out;
     out.append("[\n", 2);
+    out.append("{\"name\":\"", 9);
+    append_escaped(out, needle);
     out.append(
-        "{\"name\":\"format\",\"cat\":\"M\",\"pid\":0,\"tid\":0,\"ph\":\"M\","
-        "\"args\":{\"value\":\"clarion_call_tree_find\"}},\n");
+        "\",\"cat\":\"find\",\"pid\":0,\"tid\":0,\"ph\":\"M\"},\n");
     std::uint64_t idx = 0;
     serialize_agg(match.node, /*start=*/0, /*depth=*/0, synthetic,
                   match.key.pid, match.key.tid, idx, out);
@@ -1179,8 +1190,8 @@ coro::CoroTask<void> ingest_one_file(std::string path, BucketMap* out,
             node_id = static_cast<std::uint32_t>(p.get<std::uint64_t>());
 
         const ProcessKey key(static_cast<std::uint32_t>(ev.pid), tid, node_id);
-        (*out)[key].push_back(
-            {name_intern().intern(ev.name), ev.ts, ev.dur});
+        (*out)[key].push_back({name_intern().intern(ev.name),
+                               name_intern().intern(ev.cat), ev.ts, ev.dur});
         ++processed;
     }
     total->fetch_add(processed, std::memory_order_relaxed);
@@ -1472,7 +1483,8 @@ coro::CoroTask<void> task_write_find(RunCtx* ctx) {
     const bool synthetic = ctx->cli->aggregate;
     const std::string ext = ".pfw";
     for (std::size_t i = 0; i < matches.size(); ++i) {
-        const std::string body = render_match_json(matches[i], synthetic);
+        const std::string body =
+            render_match_json(matches[i], needle, synthetic);
                                      
         const std::string path =
             match_output_path(ctx->output_path, matches[i], i, ext);

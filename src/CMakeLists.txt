@@ -869,6 +869,7 @@ if(DFTRACER_UTILS_BUILD_BINARIES)
       ${CMAKE_CURRENT_SOURCE_DIR}/dftracer/utils/binaries/dftracer_replay.cpp
       ${CMAKE_CURRENT_SOURCE_DIR}/dftracer/utils/binaries/clarion_calltree.cpp
       ${CMAKE_CURRENT_SOURCE_DIR}/dftracer/utils/binaries/clarion_comparator.cpp
+      ${CMAKE_CURRENT_SOURCE_DIR}/dftracer/utils/binaries/clarion_catalog.cpp
       ${CMAKE_CURRENT_SOURCE_DIR}/dftracer/utils/binaries/dftracer_call_tree.cpp
       ${CMAKE_CURRENT_SOURCE_DIR}/dftracer/utils/binaries/dftracer_aggregator.cpp
       ${CMAKE_CURRENT_SOURCE_DIR}/dftracer/utils/binaries/dftracer_index.cpp
@@ -924,6 +925,11 @@ if(DFTRACER_UTILS_BUILD_BINARIES)
       create_python_wrapper(${bin_exec})
     endif()
   endforeach()
+
+  # clarion_catalog includes <yaml-cpp/yaml.h> directly (unlike the other
+  # binaries, which only reach yaml-cpp indirectly through dftracer_utils),
+  # so it needs the yaml-cpp include path propagated explicitly.
+  link_yaml_cpp(clarion_catalog)
 
   foreach(bin ${DFTRACER_MPI_BINARIES})
     string(REPLACE ".cpp" "" bin_exec ${bin})
