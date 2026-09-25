@@ -46,6 +46,13 @@
 //                                tables (function, ancestor, count, plus
 //                                expected_range/observed or the diverging
 //                                children and duration comparison)
+//             --find           -> one combined text section, or one JSON
+//                                file per match (<output>_<name>_<i>.pfw)
+//             --catalog        -> like --find, but looks up every function
+//                                listed in a clarion_catalog YAML file
+//                                instead of a single needle; each match is
+//                                gzip-compressed to
+//                                <catalog-output>/<name>_<i>.pfw.gz
 
 #include <dftracer/utils/call_tree/internal/process_key.h>
 #include <dftracer/utils/core/common/byte_view.h>
@@ -62,6 +69,9 @@
 #include <dftracer/utils/utilities/fileio/parallel/parallel_writer.h>
 #include <dftracer/utils/utilities/reader/trace_reader.h>
 
+#include <yaml-cpp/yaml.h>
+#include <zlib.h>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -70,6 +80,7 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <map>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -696,6 +707,25 @@ bool write_file(const std::string& path, const std::string& bytes) {
     return ok;
 }
 
+bool write_gzip_file(const std::string& path, const std::string& bytes) {
+    gzFile f = gzopen(path.c_str(), "wb");
+    if (!f) return false;
+    std::size_t written = 0;
+    bool ok = true;
+    while (written < bytes.size()) {
+        const unsigned chunk = static_cast<unsigned>(std::min<std::size_t>(
+            bytes.size() - written, std::size_t{1} << 20));
+        const int rc = gzwrite(f, bytes.data() + written, chunk);
+        if (rc <= 0) {
+            ok = false;
+            break;
+        }
+        written += static_cast<std::size_t>(rc);
+    }
+    if (gzclose(f) != Z_OK) ok = false;
+    return ok && written == bytes.size();
+}
+
 // ── Anomaly report (plain text tables) ──────────────────────────────────────
 
 std::string join_names(const std::vector<std::string_view>& names) {
@@ -944,6 +974,21 @@ std::string render_match_json(const FoundNode& match, std::string_view needle,
     return out;
 }
 
+// Replace anything but [A-Za-z0-9._-] with '_' and cap length, so a function
+// name is safe to use as a filename fragment.
+std::string sanitize_filename_part(std::string_view s) {
+    std::string name;
+    name.reserve(s.size());
+    for (char c : s) {
+        const bool safe = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                          (c >= '0' && c <= '9') || c == '.' || c == '-' ||
+                          c == '_';
+        name += safe ? c : '_';
+    }
+    if (name.size() > 96) name.resize(96);
+    return name;
+}
+
 // json/binary: <stem>_<sanitized name>_<index><ext>, one file per match.
 std::string match_output_path(const std::string& base, const FoundNode& match,
                               std::size_t index, const std::string& ext) {
@@ -952,18 +997,182 @@ std::string match_output_path(const std::string& base, const FoundNode& match,
         stem.compare(stem.size() - ext.size(), ext.size(), ext) == 0) {
         stem.resize(stem.size() - ext.size());
     }
-    std::string name;
-    name.reserve(match.node->name.size());
-    for (char c : match.node->name) {
-        const bool safe = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                          (c >= '0' && c <= '9') || c == '.' || c == '-' ||
-                          c == '_';
-        name += safe ? c : '_';
-    }
-    if (name.size() > 96) name.resize(96);
     char buf[32];
     std::snprintf(buf, sizeof(buf), "_%zu", index);
-    return stem + "_" + name + buf + ext;
+    return stem + "_" + sanitize_filename_part(match.node->name) + buf + ext;
+}
+
+// <dir>/<sanitized function name>_<index><ext>, one file per match, for
+// --catalog output (one subtree dump per occurrence of a catalog function).
+std::string catalog_output_path(const std::string& dir,
+                                std::string_view function_name,
+                                std::size_t index, const std::string& ext) {
+    std::string path = dir;
+    if (!path.empty() && path.back() != '/') path += '/';
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "_%zu", index);
+    return path + sanitize_filename_part(function_name) + buf + ext;
+}
+
+// Flattens every function name across every category of a clarion_catalog
+// YAML file (see clarion_catalog.cpp) into a deduplicated list, preserving
+// first-seen order.
+std::vector<std::string> load_catalog_functions(const std::string& path) {
+    std::vector<std::string> out;
+    YAML::Node root;
+    try {
+        root = YAML::LoadFile(path);
+    } catch (const std::exception& err) {
+        DFTRACER_UTILS_LOG_ERROR("failed to parse catalog %s: %s", path.c_str(),
+                                 err.what());
+        return out;
+    }
+    if (!root["cat"]) return out;
+    std::unordered_set<std::string> seen;
+    for (const auto& entry : root["cat"]) {
+        if (!entry.second) continue;
+        for (const auto& fn : entry.second) {
+            std::string name = fn.as<std::string>();
+            if (seen.insert(name).second) out.push_back(std::move(name));
+        }
+    }
+    return out;
+}
+
+// ── Catalog index ───────────────────────────────────────────────────────────
+//
+// <catalog-output>/catalog_index.yaml records, per catalog function, the next
+// unused file index and one entry per file written so far (which trace(s) it
+// came from, and its aggregate count/dur), so repeated --catalog runs append
+// new files instead of overwriting old ones.
+
+struct CatalogEntry {
+    std::size_t index = 0;
+    std::string file;
+    std::vector<std::string> traces;
+    std::uint32_t node_id = 0;
+    long long count = 0, dur = 0;
+    // Reserved for the settings the producing run used; empty for now, but
+    // preserved verbatim across index rewrites.
+    YAML::Node configuration{YAML::NodeType::Map};
+};
+
+struct CatalogIndex {
+    std::map<std::string, std::size_t> next;
+    std::map<std::string, std::vector<CatalogEntry>> entries;
+};
+
+constexpr const char* kCatalogIndexName = "catalog_index.yaml";
+
+std::string catalog_index_path(const std::string& dir) {
+    std::string path = dir;
+    if (!path.empty() && path.back() != '/') path += '/';
+    return path + kCatalogIndexName;
+}
+
+// A missing index is normal (first run). An unreadable one is not fatal
+// either: next_free_index() also scans the directory, so files are still
+// never overwritten.
+CatalogIndex load_catalog_index(const std::string& path) {
+    CatalogIndex idx;
+    std::error_code ec;
+    if (!fs::exists(path, ec)) return idx;
+    try {
+        const YAML::Node root = YAML::LoadFile(path);
+        const YAML::Node fns = root["functions"];
+        if (!fns) return idx;
+        for (const auto& kv : fns) {
+            const std::string name = kv.first.as<std::string>();
+            idx.next[name] = kv.second["next"].as<std::size_t>(0);
+            for (const auto& e : kv.second["entries"]) {
+                CatalogEntry ce;
+                ce.index = e["index"].as<std::size_t>(0);
+                ce.file = e["file"].as<std::string>("");
+                for (const auto& t : e["traces"])
+                    ce.traces.push_back(t.as<std::string>());
+                ce.node_id = e["node_id"].as<std::uint32_t>(0);
+                ce.count = e["count"].as<long long>(0);
+                ce.dur = e["dur"].as<long long>(0);
+                if (e["configuration"].IsMap())
+                    ce.configuration = YAML::Clone(e["configuration"]);
+                idx.entries[name].push_back(std::move(ce));
+            }
+        }
+    } catch (const std::exception& err) {
+        DFTRACER_UTILS_LOG_WARN("ignoring unreadable catalog index %s: %s",
+                                path.c_str(), err.what());
+        return CatalogIndex{};
+    }
+    return idx;
+}
+
+// Written to a temp file and renamed so a crash can't leave a torn index.
+bool save_catalog_index(const std::string& path, const CatalogIndex& idx) {
+    YAML::Node fns(YAML::NodeType::Map);
+    for (const auto& [name, next] : idx.next) {
+        YAML::Node f;
+        f["next"] = next;
+        YAML::Node entries(YAML::NodeType::Sequence);
+        auto it = idx.entries.find(name);
+        if (it != idx.entries.end()) {
+            for (const CatalogEntry& ce : it->second) {
+                YAML::Node e;
+                e["index"] = ce.index;
+                e["file"] = ce.file;
+                YAML::Node traces(YAML::NodeType::Sequence);
+                for (const auto& t : ce.traces) traces.push_back(t);
+                e["traces"] = traces;
+                e["node_id"] = ce.node_id;
+                e["count"] = ce.count;
+                e["dur"] = ce.dur;
+                YAML::Node cfg = YAML::Clone(ce.configuration);
+                if (cfg.size() == 0) cfg.SetStyle(YAML::EmitterStyle::Flow);
+                e["configuration"] = cfg;
+                entries.push_back(e);
+            }
+        }
+        f["entries"] = entries;
+        fns[name] = f;
+    }
+    YAML::Node root;
+    root["functions"] = fns;
+
+    YAML::Emitter emit;
+    emit.SetIndent(2);
+    emit << root;
+    std::string text(emit.c_str());
+    text += "\n";
+
+    const std::string tmp = path + ".tmp";
+    if (!write_file(tmp, text)) return false;
+    std::error_code ec;
+    fs::rename(tmp, path, ec);
+    return !ec;
+}
+
+// First index for `stem` (sanitized function name) that is free both in the
+// index and on disk: the larger of the recorded `next` and one past the
+// highest <stem>_<N><ext> already in `dir`.
+std::size_t next_free_index(const std::string& dir, const std::string& stem,
+                            const std::string& ext, std::size_t recorded) {
+    std::size_t next = recorded;
+    const std::string prefix = stem + "_";
+    std::error_code ec;
+    for (fs::directory_iterator it(dir, ec), end; !ec && it != end;
+         it.increment(ec)) {
+        const std::string name = it->path().filename().string();
+        if (name.size() <= prefix.size() + ext.size()) continue;
+        if (name.compare(0, prefix.size(), prefix) != 0) continue;
+        if (name.compare(name.size() - ext.size(), ext.size(), ext) != 0)
+            continue;
+        const std::string digits = name.substr(
+            prefix.size(), name.size() - prefix.size() - ext.size());
+        if (digits.size() > 18 ||
+            digits.find_first_not_of("0123456789") != std::string::npos)
+            continue;
+        next = std::max<std::size_t>(next, std::stoull(digits) + 1);
+    }
+    return next;
 }
 
 // <output_stem>.anomalies.txt, stripping a trailing "."-delimited extension
@@ -986,6 +1195,8 @@ class ClarionArgParse : public cli::ArgParse {
     bool recursive = false;
     std::string output;
     std::string find;
+    std::string catalog_path;
+    std::string catalog_output = "catalog";
     bool no_save = false;
     bool gzip = false;
     bool strict_nesting = false;
@@ -1067,6 +1278,17 @@ class ClarionArgParse : public cli::ArgParse {
             .help("Find a specific node in the call tree")
             .default_value<std::string>("");
         parser()
+            .add_argument("--catalog")
+            .help("Path to a clarion_catalog YAML file; look up every "
+                  "function it lists in the call tree and dump each match "
+                  "as its own gzip-compressed JSON file under "
+                  "--catalog-output")
+            .default_value<std::string>("");
+        parser()
+            .add_argument("--catalog-output")
+            .help("Directory for --catalog's per-function output files")
+            .default_value<std::string>("catalog");
+        parser()
             .add_argument("--detect-anomaly")
             .help("Flag performance outliers and structural divergences "
                   "among aggregation candidates as <output>.anomalies.txt "
@@ -1109,6 +1331,8 @@ class ClarionArgParse : public cli::ArgParse {
         hotpath = parser().get<bool>("--hotpath");
         hotpath_threshold = parser().get<double>("--hotpath-threshold");
         find = parser().get<std::string>("--find");
+        catalog_path = parser().get<std::string>("--catalog");
+        catalog_output = parser().get<std::string>("--catalog-output");
         threshold = parser().get<double>("--threshold");
         if (global_merge) aggregate = true;
         detect_anomaly = parser().get<bool>("--detect-anomaly");
@@ -1127,6 +1351,15 @@ class ClarionArgParse : public cli::ArgParse {
                 "--format must be 'text' or 'json'");
         }
     }
+
+    bool validate() override {
+        if (!find.empty() && !catalog_path.empty()) {
+            DFTRACER_UTILS_LOG_ERROR(
+                "%s", "--find and --catalog are mutually exclusive");
+            return false;
+        }
+        return true;
+    }
 };
 
 struct RunCtx {
@@ -1143,6 +1376,9 @@ struct RunCtx {
 
     std::vector<AnomalySink> bucket_anomalies;  // one per bucket, filled in task_analyze
     AnomalySink anomalies;                      // flattened across buckets + global reduce
+
+    // bucket -> indices into trace_files it has events from (--catalog only)
+    std::unordered_map<ProcessKey, std::vector<std::size_t>> key_files;
 
     std::string output_path;
     bool failed = false;
@@ -1238,8 +1474,11 @@ coro::CoroTask<void> task_build(RunCtx* ctx, CoroScope* scope) {
 
 coro::CoroTask<void> task_merge(RunCtx* ctx) {
     if (ctx->failed) co_return;
-    for (BucketMap& fragment : ctx->per_file) {
+    const bool track_files = !ctx->cli->catalog_path.empty();
+    for (std::size_t fi = 0; fi < ctx->per_file.size(); ++fi) {
+        BucketMap& fragment = ctx->per_file[fi];
         for (auto& [key, events] : fragment) {
+            if (track_files) ctx->key_files[key].push_back(fi);
             Bucket& dst = ctx->merged[key];
             if (dst.empty()) {
                 dst = std::move(events);
@@ -1498,11 +1737,99 @@ coro::CoroTask<void> task_write_find(RunCtx* ctx) {
     co_return;
 }
 
+// --catalog: run the same by-name search as --find once per function listed
+// in the catalog YAML, writing every match as its own gzip-compressed JSON
+// file (<catalog-output>/<function>_<index>.pfw.gz) instead of one combined
+// output. Indices continue from what earlier runs left in
+// <catalog-output>/catalog_index.yaml, which also records each file's source
+// trace(s).
+coro::CoroTask<void> task_write_catalog(RunCtx* ctx) {
+    const std::vector<std::string> functions =
+        load_catalog_functions(ctx->cli->catalog_path);
+    if (functions.empty()) {
+        DFTRACER_UTILS_LOG_ERROR("catalog %s has no functions to look for",
+                                 ctx->cli->catalog_path.c_str());
+        ctx->failed = true;
+        co_return;
+    }
+
+    const std::string& dir = ctx->cli->catalog_output;
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+
+    const bool synthetic = ctx->cli->aggregate;
+    const std::string ext = ".pfw.gz";
+    const std::string index_path = catalog_index_path(dir);
+    CatalogIndex index = load_catalog_index(index_path);
+    std::size_t total_matches = 0;
+    bool write_failed = false;
+
+    for (const std::string& needle : functions) {
+        std::vector<FoundNode> matches;
+        if (ctx->cli->global_merge) {
+            matches = find_in_forest(ctx->global_forest, needle);
+            for (FoundNode& m : matches) m.total_run_time = ctx->global_run_time;
+        } else {
+            for (const AggForest& f : ctx->forests) {
+                auto found = find_in_forest(f, needle);
+                matches.insert(matches.end(), found.begin(), found.end());
+            }
+        }
+        DFTRACER_UTILS_LOG_INFO("[catalog] \"%s\": %zu match(es)",
+                                needle.c_str(), matches.size());
+        if (matches.empty()) continue;
+
+        const std::size_t first = next_free_index(
+            dir, sanitize_filename_part(needle), ext, index.next[needle]);
+        for (std::size_t i = 0; i < matches.size(); ++i) {
+            const FoundNode& m = matches[i];
+            const std::size_t file_index = first + i;
+            const std::string path =
+                catalog_output_path(dir, needle, file_index, ext);
+            if (!write_gzip_file(path, render_match_json(m, needle, synthetic))) {
+                DFTRACER_UTILS_LOG_ERROR("failed to write %s", path.c_str());
+                write_failed = true;
+                break;
+            }
+
+            CatalogEntry ce;
+            ce.index = file_index;
+            ce.file = fs::path(path).filename().string();
+            ce.node_id = m.key.node_id;
+            ce.count = m.node->count;
+            ce.dur = m.node->dur;
+            if (ctx->cli->global_merge) {
+                ce.traces = ctx->trace_files;
+            } else if (auto it = ctx->key_files.find(m.key);
+                       it != ctx->key_files.end()) {
+                for (std::size_t fi : it->second)
+                    ce.traces.push_back(ctx->trace_files[fi]);
+            }
+            index.entries[needle].push_back(std::move(ce));
+            index.next[needle] = file_index + 1;
+            ++total_matches;
+        }
+        if (write_failed) break;
+    }
+
+    if (!save_catalog_index(index_path, index)) {
+        DFTRACER_UTILS_LOG_ERROR("failed to write %s", index_path.c_str());
+        write_failed = true;
+    }
+    if (write_failed) {
+        ctx->failed = true;
+        co_return;
+    }
+    std::printf("Catalog output: %s (%zu function(s), %zu new file(s))\n",
+                dir.c_str(), functions.size(), total_matches);
+    co_return;
+}
+
 coro::CoroTask<void> task_write(RunCtx* ctx, CoroScope* scope) {
     if (ctx->failed || ctx->cli->no_save) co_return;
     const OutputFormat format = ctx->cli->format;
 
-    if (ctx->cli->detect_anomaly) {
+    if (ctx->cli->detect_anomaly && ctx->cli->catalog_path.empty()) {
         const std::string report = render_anomaly_report(ctx->anomalies);
         const std::string path = anomaly_report_path(ctx->output_path);
         if (!write_file(path, report)) {
@@ -1523,6 +1850,10 @@ coro::CoroTask<void> task_write(RunCtx* ctx, CoroScope* scope) {
 
     if (!ctx->cli->find.empty()) {
         co_await task_write_find(ctx);
+        co_return;
+    }
+    if (!ctx->cli->catalog_path.empty()) {
+        co_await task_write_catalog(ctx);
         co_return;
     }
     // ── serialize ───────────────────────────────────────────────────────

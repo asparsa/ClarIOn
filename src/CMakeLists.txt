@@ -926,10 +926,12 @@ if(DFTRACER_UTILS_BUILD_BINARIES)
     endif()
   endforeach()
 
-  # clarion_catalog includes <yaml-cpp/yaml.h> directly (unlike the other
-  # binaries, which only reach yaml-cpp indirectly through dftracer_utils),
-  # so it needs the yaml-cpp include path propagated explicitly.
+  # clarion_catalog and clarion_calltree include <yaml-cpp/yaml.h> directly
+  # (unlike the other binaries, which only reach yaml-cpp indirectly through
+  # dftracer_utils), so they need the yaml-cpp include path propagated
+  # explicitly.
   link_yaml_cpp(clarion_catalog)
+  link_yaml_cpp(clarion_calltree)
 
   foreach(bin ${DFTRACER_MPI_BINARIES})
     string(REPLACE ".cpp" "" bin_exec ${bin})
